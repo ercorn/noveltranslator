@@ -23,6 +23,10 @@ func main() {
 
 	//TODO: Read input from a file to declutter code.
 	// Prompt should be the only thing here.
+	inputDir := ""
+	_ = inputDir
+	//TODO: Reference outputFile code when writing input file reading.
+
 	input := fmt.Sprint(
 		`I need you to translate this chinese webnovel chapter into english. Here are 2
 		earlier chapters both raw and then translated:
