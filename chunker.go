@@ -1,11 +1,17 @@
 package main
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+)
+
+var (
+	// ErrInvalidChunkSize indicates the requested chunk size is non-positive.
+	ErrInvalidChunkSize = errors.New("chunk size must be greater than zero")
+	// ErrEmptyChapter indicates the raw chapter has no paragraph content.
+	ErrEmptyChapter = errors.New("raw chapter has no valid paragraphs")
 )
 
 // RawChunk represents a bounded slice of raw chapter paragraphs.
@@ -16,33 +22,30 @@ type RawChunk struct {
 	Lines      []string
 }
 
-// GetChapterChunks reads a raw chapter and splits non-blank lines into chunks of chunkSize.
-func GetChapterChunks(rawDir string, chapterNum int, chunkSize int) ([]RawChunk, error) {
+// GetChapterChunks reads a raw chapter file and partitions its paragraphs into chunks of chunkSize.
+func GetChapterChunks(rawDir string, chapterNum, chunkSize int) ([]RawChunk, error) {
+	if chunkSize <= 0 {
+		return nil, ErrInvalidChunkSize
+	}
+
 	rawPath := filepath.Join(rawDir, fmt.Sprintf("chapter_%d.txt", chapterNum))
-	f, err := os.Open(rawPath)
+	rawBytes, err := os.ReadFile(rawPath)
 	if err != nil {
-		return nil, fmt.Errorf("open raw chapter %d: %w", chapterNum, err)
-	}
-	defer f.Close()
-
-	var allLines []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" && !strings.HasPrefix(line, "#") {
-			allLines = append(allLines, line)
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("read chapter %d: %w", chapterNum, ErrRawNotFound)
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan raw chapter %d: %w", chapterNum, err)
+		return nil, fmt.Errorf("read chapter %d: %w", chapterNum, err)
 	}
 
-	total := len(allLines)
+	paragraphs := ExtractRawParagraphs(string(rawBytes))
+	total := len(paragraphs)
 	if total == 0 {
-		return nil, fmt.Errorf("raw chapter %d is empty", chapterNum)
+		return nil, fmt.Errorf("chapter %d: %w", chapterNum, ErrEmptyChapter)
 	}
 
-	var chunks []RawChunk
+	numChunks := (total + chunkSize - 1) / chunkSize
+	chunks := make([]RawChunk, 0, numChunks)
+
 	chunkIdx := 1
 	for i := 0; i < total; i += chunkSize {
 		end := i + chunkSize
@@ -53,7 +56,7 @@ func GetChapterChunks(rawDir string, chapterNum int, chunkSize int) ([]RawChunk,
 			ChunkIndex: chunkIdx,
 			StartLine:  i + 1,
 			EndLine:    end,
-			Lines:      allLines[i:end],
+			Lines:      paragraphs[i:end],
 		})
 		chunkIdx++
 	}

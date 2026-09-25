@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,99 +16,126 @@ import (
 	"time"
 )
 
+var (
+	// ErrNoChaptersMatched indicates no chapters in the table of contents matched the requested range.
+	ErrNoChaptersMatched = errors.New("no chapters matched requested range")
+)
+
+var (
+	reLinkRegex      = regexp.MustCompile(`<a href="(/chapter/\w+/(\d+)\.html)"[^>]*>([^<]+)</a>`)
+	reChapterNum     = regexp.MustCompile(`第(\d+)章`)
+	reParagraph      = regexp.MustCompile(`(?s)<p>(.*?)</p>`)
+	reNextPageLink   = regexp.MustCompile(`<a [^>]*href="(/chapter/[^"]+)"[^>]*>下一[頁页]</a>`)
+	reHTMLTitle      = regexp.MustCompile(`<title>([^<]+)</title>`)
+	reStripHTMLTags  = regexp.MustCompile(`<[^>]+>`)
+)
+
 type ChapterInfo struct {
 	Number int
 	Title  string
 	URL    string
 }
 
-// FetchTOC retrieves all chapter links and numbers from the novel TOC page.
-func FetchTOC(novelID string) ([]ChapterInfo, error) {
+// sleepWithContext pauses execution for duration d or returns early if ctx is cancelled.
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// FetchTOC retrieves all chapter links and numbers from the novel table of contents page.
+func FetchTOC(ctx context.Context, client *http.Client, novelID string) ([]ChapterInfo, error) {
 	tocURL := fmt.Sprintf("https://www.uuread.tw/%s", novelID)
-	req, err := http.NewRequest("GET", tocURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tocURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create toc request: %w", err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch toc: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch toc: unexpected status %d", resp.StatusCode)
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read toc body: %w", err)
 	}
 
 	htmlContent := string(body)
-	reLink := regexp.MustCompile(`<a href="(/chapter/` + novelID + `/(\d+)\.html)"[^>]*>([^<]+)</a>`)
-	reNum := regexp.MustCompile(`第(\d+)章`)
-
-	matches := reLink.FindAllStringSubmatch(htmlContent, -1)
-	var chapters []ChapterInfo
-	seen := make(map[int]bool)
+	matches := reLinkRegex.FindAllStringSubmatch(htmlContent, -1)
+	chapters := make([]ChapterInfo, 0, len(matches))
+	seen := make(map[int]struct{}, len(matches))
 
 	for _, m := range matches {
 		href := m[1]
 		title := strings.TrimSpace(m[3])
 
-		numMatch := reNum.FindStringSubmatch(title)
+		numMatch := reChapterNum.FindStringSubmatch(title)
 		if len(numMatch) < 2 {
 			continue
 		}
 		num, err := strconv.Atoi(numMatch[1])
-		if err != nil || seen[num] {
+		if err != nil {
 			continue
 		}
-		seen[num] = true
+		if _, exists := seen[num]; exists {
+			continue
+		}
+		seen[num] = struct{}{}
 
-		fullURL := "https://www.uuread.tw" + href
 		chapters = append(chapters, ChapterInfo{
 			Number: num,
 			Title:  title,
-			URL:    fullURL,
+			URL:    "https://www.uuread.tw" + href,
 		})
 	}
 
 	return chapters, nil
 }
 
-// FetchChapterRaw downloads all pages for a chapter (including _2.html etc.) and returns the full text.
-func FetchChapterRaw(client *http.Client, startURL string) (string, []string, error) {
+// FetchChapterRaw downloads all pages for a chapter (handling multi-page pagination) and returns cleaned paragraphs.
+func FetchChapterRaw(ctx context.Context, client *http.Client, startURL string) (string, []string, error) {
 	currentURL := startURL
 	var allParagraphs []string
 	var chapterTitle string
 
-	reParagraph := regexp.MustCompile(`(?s)<p>(.*?)</p>`)
-	reNextPage := regexp.MustCompile(`<a [^>]*href="(/chapter/[^"]+)"[^>]*>下一[頁页]</a>`)
-	reTitle := regexp.MustCompile(`<title>([^<]+)</title>`)
-	reTag := regexp.MustCompile(`<[^>]+>`)
-
 	for currentURL != "" {
-		req, err := http.NewRequest("GET", currentURL, nil)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return "", nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, currentURL, nil)
+		if err != nil {
+			return "", nil, fmt.Errorf("create chapter request: %w", err)
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return "", nil, err
+			return "", nil, fmt.Errorf("fetch chapter url %q: %w", currentURL, err)
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			return "", nil, err
+			return "", nil, fmt.Errorf("read chapter response: %w", err)
 		}
 
 		htmlContent := string(body)
 
 		if chapterTitle == "" {
-			tMatch := reTitle.FindStringSubmatch(htmlContent)
+			tMatch := reHTMLTitle.FindStringSubmatch(htmlContent)
 			if len(tMatch) > 1 {
 				parts := strings.Split(tMatch[1], "_")
 				if len(parts) >= 2 {
@@ -118,23 +149,31 @@ func FetchChapterRaw(client *http.Client, startURL string) (string, []string, er
 		pMatches := reParagraph.FindAllStringSubmatch(htmlContent, -1)
 		for _, pm := range pMatches {
 			rawP := pm[1]
-			cleanP := strings.TrimSpace(reTag.ReplaceAllString(rawP, ""))
+			cleanP := strings.TrimSpace(reStripHTMLTags.ReplaceAllString(rawP, ""))
 			if cleanP == "" || strings.HasPrefix(cleanP, "uu") || strings.Contains(cleanP, "請記住本書首發域名") {
 				continue
 			}
 			allParagraphs = append(allParagraphs, cleanP)
 		}
 
-		// Check for multi-part pagination
-		nextMatch := reNextPage.FindStringSubmatch(htmlContent)
+		nextMatch := reNextPageLink.FindStringSubmatch(htmlContent)
 		if len(nextMatch) > 1 {
-			nextURL := "https://www.uuread.tw" + nextMatch[1]
-			// Avoid infinite loop if next points to itself
-			if nextURL == currentURL {
+			baseParsed, err := url.Parse(currentURL)
+			if err != nil {
+				return "", nil, fmt.Errorf("parse current url %q: %w", currentURL, err)
+			}
+			relParsed, err := url.Parse(nextMatch[1])
+			if err != nil {
+				return "", nil, fmt.Errorf("parse relative next url %q: %w", nextMatch[1], err)
+			}
+			resolvedURL := baseParsed.ResolveReference(relParsed).String()
+			if resolvedURL == currentURL {
 				currentURL = ""
 			} else {
-				currentURL = nextURL
-				time.Sleep(300 * time.Millisecond) // Polite delay
+				currentURL = resolvedURL
+				if err := sleepWithContext(ctx, 300*time.Millisecond); err != nil {
+					return "", nil, err
+				}
 			}
 		} else {
 			currentURL = ""
@@ -145,18 +184,23 @@ func FetchChapterRaw(client *http.Client, startURL string) (string, []string, er
 }
 
 // ScrapeRange downloads chapters in range [start, end] and saves them to rawDir.
-func ScrapeRange(novelID string, start, end int, rawDir string) error {
-	if err := os.MkdirAll(rawDir, 0755); err != nil {
-		return err
+func ScrapeRange(ctx context.Context, novelID string, start, end int, rawDir string, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
 	}
 
-	fmt.Printf("Fetching Table of Contents for novel %s...\n", novelID)
-	allChapters, err := FetchTOC(novelID)
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		return fmt.Errorf("create raw directory %q: %w", rawDir, err)
+	}
+
+	logger.InfoContext(ctx, "fetching novel table of contents", "novel_id", novelID)
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
+	allChapters, err := FetchTOC(ctx, httpClient, novelID)
 	if err != nil {
-		return fmt.Errorf("failed to fetch TOC: %w", err)
+		return fmt.Errorf("fetch toc: %w", err)
 	}
 
-	// Filter requested range
 	var targetChapters []ChapterInfo
 	for _, ch := range allChapters {
 		if ch.Number >= start && ch.Number <= end {
@@ -164,35 +208,41 @@ func ScrapeRange(novelID string, start, end int, rawDir string) error {
 		}
 	}
 
-	fmt.Printf("Found %d chapters in range %d - %d.\n", len(targetChapters), start, end)
+	if len(targetChapters) == 0 {
+		return fmt.Errorf("%w: range [%d, %d]", ErrNoChaptersMatched, start, end)
+	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	logger.InfoContext(ctx, "matched target chapters", "count", len(targetChapters), "start", start, "end", end)
 
 	for i, ch := range targetChapters {
-		outPath := filepath.Join(rawDir, fmt.Sprintf("chapter_%d.txt", ch.Number))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
-		// Check if already downloaded
+		outPath := filepath.Join(rawDir, fmt.Sprintf("chapter_%d.txt", ch.Number))
 		if _, err := os.Stat(outPath); err == nil {
-			fmt.Printf("[%d/%d] Chapter %d already exists, skipping.\n", i+1, len(targetChapters), ch.Number)
+			logger.InfoContext(ctx, "chapter already exists, skipping", "index", i+1, "total", len(targetChapters), "chapter", ch.Number)
 			continue
 		}
 
-		fmt.Printf("[%d/%d] Downloading Chapter %d: %s...\n", i+1, len(targetChapters), ch.Number, ch.Title)
-		title, paras, err := FetchChapterRaw(httpClient, ch.URL)
+		logger.InfoContext(ctx, "downloading chapter", "index", i+1, "total", len(targetChapters), "chapter", ch.Number, "title", ch.Title)
+		title, paras, err := FetchChapterRaw(ctx, httpClient, ch.URL)
 		if err != nil {
-			fmt.Printf("Error downloading chapter %d: %v\n", ch.Number, err)
+			logger.ErrorContext(ctx, "failed downloading chapter", "chapter", ch.Number, "error", err)
 			continue
 		}
 
 		fullContent := fmt.Sprintf("# %s\n\n%s\n", title, strings.Join(paras, "\n\n"))
-		if err := os.WriteFile(outPath, []byte(fullContent), 0644); err != nil {
-			return fmt.Errorf("failed to write raw chapter %d: %w", ch.Number, err)
+		if err := os.WriteFile(outPath, []byte(fullContent), 0o644); err != nil {
+			return fmt.Errorf("write chapter %d to %q: %w", ch.Number, outPath, err)
 		}
 
-		fmt.Printf("Saved Chapter %d (%d paragraphs)\n", ch.Number, len(paras))
-		time.Sleep(500 * time.Millisecond)
+		logger.InfoContext(ctx, "saved chapter", "chapter", ch.Number, "paragraphs", len(paras))
+		if err := sleepWithContext(ctx, 400*time.Millisecond); err != nil {
+			return err
+		}
 	}
 
-	fmt.Println("Scraping completed!")
+	logger.InfoContext(ctx, "scraping completed successfully")
 	return nil
 }
